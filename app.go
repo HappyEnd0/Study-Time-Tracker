@@ -140,15 +140,12 @@ func NewApp() (*App, error) {
 			return nil, err
 		}
 	}
-	a.settings = Settings{WindowIntervalMS: 1000, CameraIntervalMS: 500, AIIntervalSec: 30, MaxAICallsDay: 1800, CameraEnabled: false, AIEnabled: false, CapturesEnabled: false, StudyApps: []string{}}
+	a.settings = Settings{WindowIntervalMS: 1000, CameraIntervalMS: 500, AIIntervalSec: 30, MaxAICallsDay: 1800, CameraEnabled: false, AIEnabled: false, CapturesEnabled: false, AutoStartTracking: true, StudyApps: []string{}}
 	if b, e := os.ReadFile(a.configPath); e == nil {
 		_ = json.Unmarshal(b, &a.settings)
 	} else if !errors.Is(e, os.ErrNotExist) {
 		return nil, e
 	}
-	// Camera access belongs to the current app session; never show a saved
-	// preference as active when no browser camera stream exists after restart.
-	a.settings.CameraEnabled = false
 	if key, e := keyring.Get("study-tracker", "glm-api-key"); e == nil {
 		a.settings.APIKey = key
 	}
