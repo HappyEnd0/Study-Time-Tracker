@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 	"image"
-	_ "image/jpeg"
+	"image/jpeg"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -56,6 +56,13 @@ type Segment struct {
 	CapturePath string `json:"capturePath"`
 }
 
+type VisualCapture struct {
+	ID         int64  `json:"id"`
+	CapturedAt string `json:"capturedAt"`
+	Kind       string `json:"kind"`
+	Thumbnail  string `json:"thumbnail"`
+}
+
 type App struct {
 	ctx                context.Context
 	mu                 sync.Mutex
@@ -81,6 +88,8 @@ type App struct {
 	cameraAvailable    bool
 	facePresent        bool
 	noFaceSince        time.Time
+	lastFaceCapture    time.Time
+	captureGeneration  uint64
 	cameraError        string
 }
 
@@ -105,7 +114,7 @@ func NewApp() (*App, error) {
 		return nil, detectorErr
 	}
 	a.faceDetector = detector
-	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS time_segments (id INTEGER PRIMARY KEY AUTOINCREMENT,start_time TEXT NOT NULL,end_time TEXT NOT NULL,state TEXT NOT NULL,evidence TEXT NOT NULL DEFAULT '',capture_path TEXT NOT NULL DEFAULT ''); CREATE TABLE IF NOT EXISTS window_usage(id INTEGER PRIMARY KEY AUTOINCREMENT,start_time TEXT NOT NULL,end_time TEXT NOT NULL,process TEXT,title TEXT,state TEXT); CREATE TABLE IF NOT EXISTS segment_edits(id INTEGER PRIMARY KEY AUTOINCREMENT,segment_id INTEGER NOT NULL,old_state TEXT NOT NULL,new_state TEXT NOT NULL,edited_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS ai_usage(date TEXT PRIMARY KEY,calls INTEGER NOT NULL DEFAULT 0)`); err != nil {
+	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS time_segments (id INTEGER PRIMARY KEY AUTOINCREMENT,start_time TEXT NOT NULL,end_time TEXT NOT NULL,state TEXT NOT NULL,evidence TEXT NOT NULL DEFAULT '',capture_path TEXT NOT NULL DEFAULT ''); CREATE TABLE IF NOT EXISTS window_usage(id INTEGER PRIMARY KEY AUTOINCREMENT,start_time TEXT NOT NULL,end_time TEXT NOT NULL,process TEXT,title TEXT,state TEXT); CREATE TABLE IF NOT EXISTS segment_edits(id INTEGER PRIMARY KEY AUTOINCREMENT,segment_id INTEGER NOT NULL,old_state TEXT NOT NULL,new_state TEXT NOT NULL,edited_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS ai_usage(date TEXT PRIMARY KEY,calls INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS visual_captures(id INTEGER PRIMARY KEY AUTOINCREMENT,captured_at TEXT NOT NULL,kind TEXT NOT NULL,path TEXT NOT NULL UNIQUE)`); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -139,6 +148,10 @@ func NewApp() (*App, error) {
 			_ = db.Close()
 			return nil, err
 		}
+	}
+	if _, err = db.Exec(`INSERT OR IGNORE INTO visual_captures(captured_at,kind,path) SELECT start_time,'screen',capture_path FROM time_segments WHERE capture_path<>''`); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 	a.settings = Settings{WindowIntervalMS: 1000, CameraIntervalMS: 500, AIIntervalSec: 30, MaxAICallsDay: 1800, CameraEnabled: false, AIEnabled: false, CapturesEnabled: false, AutoStartTracking: true, StudyApps: []string{}}
 	if b, e := os.ReadFile(a.configPath); e == nil {
@@ -448,11 +461,23 @@ func (a *App) captureSegmentSnapshot(state string, segmentStart time.Time) {
 		return
 	}
 	if changed, _ := result.RowsAffected(); changed > 0 {
+		if _, err = a.db.Exec(`INSERT OR IGNORE INTO visual_captures(captured_at,kind,path) VALUES(?, 'screen', ?)`, segmentStart.Format(time.RFC3339Nano), path); err != nil {
+			_ = os.Remove(path)
+			_, _ = a.db.Exec(`UPDATE time_segments SET capture_path='' WHERE start_time=? AND state=? AND capture_path=?`, segmentStart.Format(time.RFC3339Nano), state, path)
+			a.logLocked("ERROR", "登记状态截图失败: "+err.Error())
+			return
+		}
 		a.logLocked("INFO", "状态截图已保存")
 		return
 	}
 	if a.active && a.segmentStart.Equal(segmentStart) && a.segmentState == state && a.settings.CapturesEnabled {
 		a.segmentCapturePath = path
+		if _, err = a.db.Exec(`INSERT OR IGNORE INTO visual_captures(captured_at,kind,path) VALUES(?, 'screen', ?)`, segmentStart.Format(time.RFC3339Nano), path); err != nil {
+			a.segmentCapturePath = ""
+			_ = os.Remove(path)
+			a.logLocked("ERROR", "登记状态截图失败: "+err.Error())
+			return
+		}
 		a.logLocked("INFO", "状态截图已保存")
 		return
 	}
@@ -535,6 +560,120 @@ func (a *App) GetSegmentCapture(id int64) (string, error) {
 	return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(data), nil
 }
 
+func (a *App) GetVisualCaptures(days int) []VisualCapture {
+	if days < 1 || days > 3650 {
+		days = 30
+	}
+	cutoff := time.Now().AddDate(0, 0, -days).Format("2006-01-02")
+	a.mu.Lock()
+	rows, err := a.db.Query(`SELECT id,captured_at,kind,path FROM visual_captures WHERE substr(captured_at,1,10)>=? ORDER BY captured_at DESC,id DESC LIMIT 120`, cutoff)
+	if err != nil {
+		a.mu.Unlock()
+		return []VisualCapture{}
+	}
+	type capturePath struct {
+		item VisualCapture
+		path string
+	}
+	paths := []capturePath{}
+	for rows.Next() {
+		var x capturePath
+		if rows.Scan(&x.item.ID, &x.item.CapturedAt, &x.item.Kind, &x.path) == nil {
+			paths = append(paths, x)
+		}
+	}
+	rowsErr := rows.Err()
+	_ = rows.Close()
+	a.mu.Unlock()
+	if rowsErr != nil {
+		return []VisualCapture{}
+	}
+	out := make([]VisualCapture, 0, len(paths))
+	for _, x := range paths {
+		if !a.isCapturePath(x.path) {
+			continue
+		}
+		thumb, err := captureThumbnail(x.path)
+		if err != nil {
+			continue
+		}
+		x.item.Thumbnail = "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(thumb)
+		out = append(out, x.item)
+	}
+	return out
+}
+
+func (a *App) GetVisualCaptureImage(id int64) (string, error) {
+	a.mu.Lock()
+	var path string
+	err := a.db.QueryRow(`SELECT path FROM visual_captures WHERE id=?`, id).Scan(&path)
+	a.mu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	if !a.isCapturePath(path) {
+		return "", errors.New("图片路径无效")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(data), nil
+}
+
+func (a *App) DeleteVisualCapture(id int64) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var path string
+	if err := a.db.QueryRow(`SELECT path FROM visual_captures WHERE id=?`, id).Scan(&path); err != nil {
+		return err
+	}
+	if !a.isCapturePath(path) {
+		return errors.New("图片路径无效")
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if _, err := a.db.Exec(`UPDATE time_segments SET capture_path='' WHERE capture_path=?`, path); err != nil {
+		return err
+	}
+	_, err := a.db.Exec(`DELETE FROM visual_captures WHERE id=?`, id)
+	return err
+}
+
+func captureThumbnail(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	src, err := jpeg.Decode(file)
+	if err != nil {
+		return nil, err
+	}
+	bounds := src.Bounds()
+	sw, sh := bounds.Dx(), bounds.Dy()
+	const maxWidth = 320
+	dw, dh := sw, sh
+	if dw > maxWidth {
+		dw = maxWidth
+		dh = max(1, sh*dw/sw)
+	}
+	thumb := image.NewRGBA(image.Rect(0, 0, dw, dh))
+	for y := 0; y < dh; y++ {
+		for x := 0; x < dw; x++ {
+			sx := bounds.Min.X + x*sw/dw
+			sy := bounds.Min.Y + y*sh/dh
+			thumb.Set(x, y, src.At(sx, sy))
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, thumb, &jpeg.Options{Quality: 55}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 func (a *App) DeleteSegmentCapture(id int64) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -552,7 +691,74 @@ func (a *App) DeleteSegmentCapture(id int64) error {
 		return err
 	}
 	_, err := a.db.Exec(`UPDATE time_segments SET capture_path='' WHERE id=?`, id)
+	if err == nil {
+		_, err = a.db.Exec(`DELETE FROM visual_captures WHERE path=?`, path)
+	}
 	return err
+}
+
+func (a *App) ClearRecentRecords(days int) (int, error) {
+	if days < 1 || days > 3650 {
+		days = 30
+	}
+	cutoff := time.Now().AddDate(0, 0, -days).Format("2006-01-02")
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	paths := map[string]struct{}{}
+	for _, query := range []string{
+		`SELECT path FROM visual_captures WHERE substr(captured_at,1,10)>=?`,
+		`SELECT capture_path FROM time_segments WHERE substr(start_time,1,10)>=? AND capture_path<>''`,
+	} {
+		rows, err := a.db.Query(query, cutoff)
+		if err != nil {
+			return 0, err
+		}
+		for rows.Next() {
+			var path string
+			if rows.Scan(&path) == nil && path != "" {
+				paths[path] = struct{}{}
+			}
+		}
+		if err = rows.Err(); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		rows.Close()
+	}
+	tx, err := a.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`DELETE FROM segment_edits WHERE segment_id IN (SELECT id FROM time_segments WHERE substr(start_time,1,10)>=?)`, cutoff); err != nil {
+		return 0, err
+	}
+	result, err := tx.Exec(`DELETE FROM time_segments WHERE substr(start_time,1,10)>=?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	count, _ := result.RowsAffected()
+	if _, err = tx.Exec(`DELETE FROM visual_captures WHERE substr(captured_at,1,10)>=?`, cutoff); err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	if a.active {
+		a.segmentStart = time.Now()
+		a.segmentCapturePath = ""
+	}
+	a.captureGeneration++
+	a.lastFaceCapture = time.Time{}
+	for path := range paths {
+		if a.isCapturePath(path) {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				a.logLocked("ERROR", "清理截图文件失败: "+err.Error())
+			}
+		}
+	}
+	a.logLocked("INFO", fmt.Sprintf("已清理最近 %d 天记录", days))
+	return int(count), nil
 }
 
 func (a *App) isCapturePath(path string) bool {
@@ -776,10 +982,66 @@ func (a *App) DetectFace(dataURL string) (bool, error) {
 	detections = detector.ClusterDetections(detections, 0.2)
 	for _, detection := range detections {
 		if detection.Q > 5.0 {
+			a.saveFaceCapture(img)
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+func (a *App) saveFaceCapture(img image.Image) {
+	now := time.Now()
+	a.mu.Lock()
+	if !a.settings.CameraEnabled || (!a.lastFaceCapture.IsZero() && now.Sub(a.lastFaceCapture) < 15*time.Minute) {
+		a.mu.Unlock()
+		return
+	}
+	a.lastFaceCapture = now
+	generation := a.captureGeneration
+	a.mu.Unlock()
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 65}); err != nil {
+		a.mu.Lock()
+		if a.captureGeneration == generation {
+			a.lastFaceCapture = time.Time{}
+		}
+		a.mu.Unlock()
+		a.log("ERROR", "编码人脸检测图片失败: "+err.Error())
+		return
+	}
+	dir := filepath.Join(filepath.Dir(a.configPath), "captures")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		a.mu.Lock()
+		if a.captureGeneration == generation {
+			a.lastFaceCapture = time.Time{}
+		}
+		a.mu.Unlock()
+		a.log("ERROR", "创建人脸图片目录失败: "+err.Error())
+		return
+	}
+	path := filepath.Join(dir, "face-"+now.Format("20060102-150405.000")+".jpg")
+	if err := os.WriteFile(path, buf.Bytes(), 0600); err != nil {
+		a.mu.Lock()
+		if a.captureGeneration == generation {
+			a.lastFaceCapture = time.Time{}
+		}
+		a.mu.Unlock()
+		a.log("ERROR", "保存人脸检测图片失败: "+err.Error())
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.captureGeneration != generation || !a.settings.CameraEnabled {
+		_ = os.Remove(path)
+		return
+	}
+	if _, err := a.db.Exec(`INSERT INTO visual_captures(captured_at,kind,path) VALUES(?, 'face', ?)`, now.Format(time.RFC3339Nano), path); err != nil {
+		_ = os.Remove(path)
+		a.lastFaceCapture = time.Time{}
+		a.logLocked("ERROR", "登记人脸检测图片失败: "+err.Error())
+		return
+	}
+	a.logLocked("INFO", "人脸检测图片已保存")
 }
 
 func (a *App) SetCameraSignal(present bool, errorText string) {
