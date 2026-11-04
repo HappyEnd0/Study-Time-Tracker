@@ -1,0 +1,24 @@
+# Go build outputs
+/build/bin/
+*.exe
+*.exe~
+
+# Frontend dependencies and generated files
+/frontend/node_modules/
+/frontend/dist/
+/frontend/wailsjs/
+/frontend/*.tsbuildinfo
+/frontend/package.json.md5
+
+# Local data and diagnostics
+/data/*.db
+/data/*.db-shm
+/data/*.db-wal
+/data/*.log
+/data/captures/
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
