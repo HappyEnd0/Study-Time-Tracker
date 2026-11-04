@@ -29,17 +29,17 @@ import (
 var faceCascade []byte
 
 type Settings struct {
-	WindowIntervalMS int      `json:"windowIntervalMs"`
-	CameraIntervalMS int      `json:"cameraIntervalMs"`
-	AIIntervalSec    int      `json:"aiIntervalSec"`
-	CameraEnabled    bool     `json:"cameraEnabled"`
-	AIEnabled        bool     `json:"aiEnabled"`
-	CapturesEnabled  bool     `json:"capturesEnabled"`
-	StudyApps        []string `json:"studyApps"`
-	APIKey           string   `json:"apiKey"`
-	MaxAICallsDay    int      `json:"maxAICallsDay"`
-	DebugEnabled     bool     `json:"debugEnabled"`
-	AutoStartTracking bool    `json:"autoStartTracking"`
+	WindowIntervalMS  int      `json:"windowIntervalMs"`
+	CameraIntervalMS  int      `json:"cameraIntervalMs"`
+	AIIntervalSec     int      `json:"aiIntervalSec"`
+	CameraEnabled     bool     `json:"cameraEnabled"`
+	AIEnabled         bool     `json:"aiEnabled"`
+	CapturesEnabled   bool     `json:"capturesEnabled"`
+	StudyApps         []string `json:"studyApps"`
+	APIKey            string   `json:"apiKey"`
+	MaxAICallsDay     int      `json:"maxAICallsDay"`
+	DebugEnabled      bool     `json:"debugEnabled"`
+	AutoStartTracking bool     `json:"autoStartTracking"`
 }
 
 type LogEntry struct {
@@ -48,38 +48,40 @@ type LogEntry struct {
 	Message string `json:"message"`
 }
 type Segment struct {
-	ID       int64  `json:"id"`
-	Start    string `json:"start"`
-	End      string `json:"end"`
-	State    string `json:"state"`
-	Evidence string `json:"evidence"`
+	ID          int64  `json:"id"`
+	Start       string `json:"start"`
+	End         string `json:"end"`
+	State       string `json:"state"`
+	Evidence    string `json:"evidence"`
+	CapturePath string `json:"capturePath"`
 }
 
 type App struct {
-	ctx             context.Context
-	mu              sync.Mutex
-	settings        Settings
-	configPath      string
-	logPath         string
-	logs            []LogEntry
-	startedAt       time.Time
-	active          bool
-	db              *sql.DB
-	trackCancel     context.CancelFunc
-	trackContext    context.Context
-	segmentStart    time.Time
-	segmentState    string
-	foreground      string
-	process         string
-	lastAIAnalysis  time.Time
-	lastAIResult    string
-	aiState         string
-	aiStateAt       time.Time
-	faceDetector    *pigo.Pigo
-	cameraAvailable bool
-	facePresent     bool
-	noFaceSince     time.Time
-	cameraError     string
+	ctx                context.Context
+	mu                 sync.Mutex
+	settings           Settings
+	configPath         string
+	logPath            string
+	logs               []LogEntry
+	startedAt          time.Time
+	active             bool
+	db                 *sql.DB
+	trackCancel        context.CancelFunc
+	trackContext       context.Context
+	segmentStart       time.Time
+	segmentState       string
+	segmentCapturePath string
+	foreground         string
+	process            string
+	lastAIAnalysis     time.Time
+	lastAIResult       string
+	aiState            string
+	aiStateAt          time.Time
+	faceDetector       *pigo.Pigo
+	cameraAvailable    bool
+	facePresent        bool
+	noFaceSince        time.Time
+	cameraError        string
 }
 
 func NewApp() (*App, error) {
@@ -103,9 +105,40 @@ func NewApp() (*App, error) {
 		return nil, detectorErr
 	}
 	a.faceDetector = detector
-	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS time_segments (id INTEGER PRIMARY KEY AUTOINCREMENT,start_time TEXT NOT NULL,end_time TEXT NOT NULL,state TEXT NOT NULL,evidence TEXT NOT NULL DEFAULT ''); CREATE TABLE IF NOT EXISTS window_usage(id INTEGER PRIMARY KEY AUTOINCREMENT,start_time TEXT NOT NULL,end_time TEXT NOT NULL,process TEXT,title TEXT,state TEXT); CREATE TABLE IF NOT EXISTS segment_edits(id INTEGER PRIMARY KEY AUTOINCREMENT,segment_id INTEGER NOT NULL,old_state TEXT NOT NULL,new_state TEXT NOT NULL,edited_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS ai_usage(date TEXT PRIMARY KEY,calls INTEGER NOT NULL DEFAULT 0)`); err != nil {
+	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS time_segments (id INTEGER PRIMARY KEY AUTOINCREMENT,start_time TEXT NOT NULL,end_time TEXT NOT NULL,state TEXT NOT NULL,evidence TEXT NOT NULL DEFAULT '',capture_path TEXT NOT NULL DEFAULT ''); CREATE TABLE IF NOT EXISTS window_usage(id INTEGER PRIMARY KEY AUTOINCREMENT,start_time TEXT NOT NULL,end_time TEXT NOT NULL,process TEXT,title TEXT,state TEXT); CREATE TABLE IF NOT EXISTS segment_edits(id INTEGER PRIMARY KEY AUTOINCREMENT,segment_id INTEGER NOT NULL,old_state TEXT NOT NULL,new_state TEXT NOT NULL,edited_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS ai_usage(date TEXT PRIMARY KEY,calls INTEGER NOT NULL DEFAULT 0)`); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	columns, err := db.Query(`PRAGMA table_info(time_segments)`)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	hasCapturePath := false
+	for columns.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err = columns.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			columns.Close()
+			_ = db.Close()
+			return nil, err
+		}
+		if name == "capture_path" {
+			hasCapturePath = true
+		}
+	}
+	if err = columns.Err(); err != nil {
+		columns.Close()
+		_ = db.Close()
+		return nil, err
+	}
+	columns.Close()
+	if !hasCapturePath {
+		if _, err = db.Exec(`ALTER TABLE time_segments ADD COLUMN capture_path TEXT NOT NULL DEFAULT ''`); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
 	a.settings = Settings{WindowIntervalMS: 1000, CameraIntervalMS: 500, AIIntervalSec: 30, MaxAICallsDay: 1800, CameraEnabled: false, AIEnabled: false, CapturesEnabled: false, StudyApps: []string{}}
 	if b, e := os.ReadFile(a.configPath); e == nil {
@@ -113,6 +146,9 @@ func NewApp() (*App, error) {
 	} else if !errors.Is(e, os.ErrNotExist) {
 		return nil, e
 	}
+	// Camera access belongs to the current app session; never show a saved
+	// preference as active when no browser camera stream exists after restart.
+	a.settings.CameraEnabled = false
 	if key, e := keyring.Get("study-tracker", "glm-api-key"); e == nil {
 		a.settings.APIKey = key
 	}
@@ -144,8 +180,12 @@ func NewApp() (*App, error) {
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	a.log("INFO", "桌面窗口启动")
-	a.mu.Lock(); autoStart:=a.settings.AutoStartTracking; a.mu.Unlock()
-	if autoStart { a.StartTracking() }
+	a.mu.Lock()
+	autoStart := a.settings.AutoStartTracking
+	a.mu.Unlock()
+	if autoStart {
+		a.StartTracking()
+	}
 }
 func (a *App) shutdown(ctx context.Context) {
 	a.StopTracking()
@@ -214,9 +254,6 @@ func (a *App) SaveSettings(s Settings) error {
 	if s.MaxAICallsDay < 1 || s.MaxAICallsDay > 2000 {
 		return errors.New("每日 AI 调用上限须为 1–2000 次")
 	}
-	if !s.AIEnabled {
-		s.APIKey = ""
-	}
 	if s.APIKey != "" {
 		if err := keyring.Set("study-tracker", "glm-api-key", s.APIKey); err != nil {
 			return errors.New("无法安全保存 API Key：" + err.Error())
@@ -241,6 +278,12 @@ func (a *App) SaveSettings(s Settings) error {
 		return err
 	}
 	a.settings = s
+	if !s.AIEnabled {
+		a.aiState = ""
+		a.aiStateAt = time.Time{}
+		a.lastAIResult = ""
+		a.lastAIAnalysis = time.Time{}
+	}
 	a.logLocked("INFO", "设置已保存")
 	return nil
 }
@@ -297,20 +340,23 @@ func (a *App) flushLocked() {
 		state = "unknown"
 	}
 	start := a.segmentStart
+	capturePath := a.segmentCapturePath
 	for start.Before(end) {
 		midnight := time.Date(start.Year(), start.Month(), start.Day()+1, 0, 0, 0, 0, start.Location())
 		partEnd := end
 		if midnight.Before(partEnd) {
 			partEnd = midnight
 		}
-		_, err := a.db.Exec(`INSERT INTO time_segments(start_time,end_time,state,evidence) VALUES(?,?,?,?)`, start.Format(time.RFC3339Nano), partEnd.Format(time.RFC3339Nano), state, a.process+" | "+a.foreground)
+		_, err := a.db.Exec(`INSERT INTO time_segments(start_time,end_time,state,evidence,capture_path) VALUES(?,?,?,?,?)`, start.Format(time.RFC3339Nano), partEnd.Format(time.RFC3339Nano), state, a.process+" | "+a.foreground, capturePath)
 		if err != nil {
 			a.logLocked("ERROR", "保存时间片失败: "+err.Error())
 			return
 		}
+		capturePath = ""
 		start = partEnd
 	}
 	a.segmentStart = end
+	a.segmentCapturePath = ""
 }
 func (a *App) trackLoop(ctx context.Context) {
 	for {
@@ -326,6 +372,8 @@ func (a *App) trackLoop(ctx context.Context) {
 		}
 		ticker.Stop()
 		proc, title, err := foregroundWindow()
+		captureStart := time.Time{}
+		captureState := ""
 		a.mu.Lock()
 		if !a.active {
 			a.mu.Unlock()
@@ -341,7 +389,7 @@ func (a *App) trackLoop(ctx context.Context) {
 					break
 				}
 			}
-			if a.aiState != "" && time.Since(a.aiStateAt) < time.Duration(a.settings.AIIntervalSec*2)*time.Second {
+			if a.settings.AIEnabled && a.aiState != "" && time.Since(a.aiStateAt) < time.Duration(a.settings.AIIntervalSec*2)*time.Second {
 				state = a.aiState
 			}
 			if a.settings.CameraEnabled && a.cameraAvailable && !a.facePresent && !a.noFaceSince.IsZero() && time.Since(a.noFaceSince) >= 8*time.Second {
@@ -351,6 +399,11 @@ func (a *App) trackLoop(ctx context.Context) {
 				a.flushLocked()
 				a.segmentStart = time.Now()
 				a.segmentState = state
+				a.segmentCapturePath = ""
+				if a.settings.CapturesEnabled {
+					captureStart = a.segmentStart
+					captureState = state
+				}
 				a.logLocked("DEBUG", "状态变化为 "+state)
 			}
 			a.process = proc
@@ -364,10 +417,49 @@ func (a *App) trackLoop(ctx context.Context) {
 			a.lastAIAnalysis = time.Now()
 		}
 		a.mu.Unlock()
+		if captureState != "" {
+			go a.captureSegmentSnapshot(captureState, captureStart)
+		}
 		if shouldAnalyze {
 			go a.analyzeForeground()
 		}
 	}
+}
+
+func (a *App) captureSegmentSnapshot(state string, segmentStart time.Time) {
+	img, err := captureActiveWindowJPEG()
+	if err != nil {
+		a.log("ERROR", "状态截图失败: "+err.Error())
+		return
+	}
+	dir := filepath.Join(filepath.Dir(a.configPath), "captures")
+	if err = os.MkdirAll(dir, 0700); err != nil {
+		a.log("ERROR", "创建截图目录失败: "+err.Error())
+		return
+	}
+	path := filepath.Join(dir, segmentStart.Format("20060102-150405.000")+"-"+state+".jpg")
+	if err = os.WriteFile(path, img, 0600); err != nil {
+		a.log("ERROR", "保存状态截图失败: "+err.Error())
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	result, err := a.db.Exec(`UPDATE time_segments SET capture_path=? WHERE start_time=? AND state=? AND capture_path=''`, path, segmentStart.Format(time.RFC3339Nano), state)
+	if err != nil {
+		_ = os.Remove(path)
+		a.logLocked("ERROR", "关联状态截图失败: "+err.Error())
+		return
+	}
+	if changed, _ := result.RowsAffected(); changed > 0 {
+		a.logLocked("INFO", "状态截图已保存")
+		return
+	}
+	if a.active && a.segmentStart.Equal(segmentStart) && a.segmentState == state && a.settings.CapturesEnabled {
+		a.segmentCapturePath = path
+		a.logLocked("INFO", "状态截图已保存")
+		return
+	}
+	_ = os.Remove(path)
 }
 func (a *App) analyzeForeground() {
 	img, err := captureActiveWindowJPEG()
@@ -382,6 +474,10 @@ func (a *App) analyzeForeground() {
 	}
 	text, _ := result["analysis"].(string)
 	a.mu.Lock()
+	if !a.active || !a.settings.AIEnabled {
+		a.mu.Unlock()
+		return
+	}
 	a.lastAIResult = text
 	newState := ""
 	if strings.Contains(text, "非学习") {
@@ -406,7 +502,7 @@ func (a *App) GetSegments(days int) []Segment {
 		days = 30
 	}
 	cutoff := time.Now().AddDate(0, 0, -days).Format("2006-01-02")
-	rows, err := a.db.Query(`SELECT id,start_time,end_time,state,evidence FROM time_segments WHERE substr(start_time,1,10)>=? ORDER BY start_time DESC LIMIT 1000`, cutoff)
+	rows, err := a.db.Query(`SELECT id,start_time,end_time,state,evidence,capture_path FROM time_segments WHERE substr(start_time,1,10)>=? ORDER BY start_time DESC LIMIT 1000`, cutoff)
 	if err != nil {
 		return []Segment{}
 	}
@@ -414,12 +510,67 @@ func (a *App) GetSegments(days int) []Segment {
 	out := []Segment{}
 	for rows.Next() {
 		var x Segment
-		if rows.Scan(&x.ID, &x.Start, &x.End, &x.State, &x.Evidence) == nil {
+		if rows.Scan(&x.ID, &x.Start, &x.End, &x.State, &x.Evidence, &x.CapturePath) == nil {
 			out = append(out, x)
 		}
 	}
 	return out
 }
+
+func (a *App) GetSegmentCapture(id int64) (string, error) {
+	a.mu.Lock()
+	var path string
+	err := a.db.QueryRow(`SELECT capture_path FROM time_segments WHERE id=?`, id).Scan(&path)
+	a.mu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	if path == "" {
+		return "", errors.New("这条记录没有截图")
+	}
+	if !a.isCapturePath(path) {
+		return "", errors.New("截图路径无效")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(data), nil
+}
+
+func (a *App) DeleteSegmentCapture(id int64) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var path string
+	if err := a.db.QueryRow(`SELECT capture_path FROM time_segments WHERE id=?`, id).Scan(&path); err != nil {
+		return err
+	}
+	if path == "" {
+		return nil
+	}
+	if !a.isCapturePath(path) {
+		return errors.New("截图路径无效")
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	_, err := a.db.Exec(`UPDATE time_segments SET capture_path='' WHERE id=?`, id)
+	return err
+}
+
+func (a *App) isCapturePath(path string) bool {
+	base, err := filepath.Abs(filepath.Join(filepath.Dir(a.configPath), "captures"))
+	if err != nil {
+		return false
+	}
+	full, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(base, full)
+	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel)
+}
+
 func (a *App) EditSegment(id int64, state string) error {
 	if state != "studying" && state != "slacking" && state != "away" && state != "unknown" {
 		return errors.New("无效状态")
