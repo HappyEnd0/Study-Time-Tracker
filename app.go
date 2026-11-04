@@ -503,6 +503,25 @@ func (a *App) ExportCSV(days int) (string, error) {
 }
 
 func (a *App) AnalyzeImage(dataURL string) (map[string]any, error) {
+	image := dataURL
+	mimeType := "image/jpeg"
+	if i := strings.Index(image, ","); i >= 0 {
+		header := image[:i]
+		image = image[i+1:]
+		if strings.HasPrefix(header, "data:") {
+			mimeType = strings.TrimSuffix(strings.TrimPrefix(header, "data:"), ";base64")
+		}
+	}
+	if mimeType != "image/jpeg" && mimeType != "image/png" && mimeType != "image/webp" {
+		return nil, errors.New("图片格式无效，请使用 JPEG、PNG 或 WebP")
+	}
+	if len(image) > 8*1024*1024 {
+		return nil, errors.New("图片过大，请选用小于 6 MB 的图片")
+	}
+	if _, err := base64.StdEncoding.DecodeString(image); err != nil {
+		return nil, errors.New("图片格式无效")
+	}
+
 	a.mu.Lock()
 	if !a.settings.AIEnabled || strings.TrimSpace(a.settings.APIKey) == "" {
 		a.mu.Unlock()
@@ -525,17 +544,7 @@ func (a *App) AnalyzeImage(dataURL string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	image := dataURL
-	if i := strings.Index(image, ","); i >= 0 {
-		image = image[i+1:]
-	}
-	if len(image) > 8*1024*1024 {
-		return nil, errors.New("图片过大，请选用小于 6 MB 的图片")
-	}
-	if _, err = base64.StdEncoding.DecodeString(image); err != nil {
-		return nil, errors.New("图片格式无效")
-	}
-	body := map[string]any{"model": "glm-4.6v-flash", "max_tokens": 160, "temperature": 0.1, "messages": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "判断这张屏幕图片是否主要展示学习、工作或知识内容。只用一句话简述判断依据，并在末尾给出标签：学习中、非学习或不确定。不要推断图片之外的信息。"}, map[string]any{"type": "image_url", "image_url": map[string]string{"url": "data:image/jpeg;base64," + image}}}}}}
+	body := map[string]any{"model": "glm-4.6v-flash", "max_tokens": 160, "temperature": 0.1, "messages": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "判断这张屏幕图片是否主要展示学习、工作或知识内容。只用一句话简述判断依据，并在末尾给出标签：学习中、非学习或不确定。不要推断图片之外的信息。"}, map[string]any{"type": "image_url", "image_url": map[string]string{"url": "data:" + mimeType + ";base64," + image}}}}}}
 	b, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -629,6 +638,13 @@ func (a *App) SetCameraSignal(present bool, errorText string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.cameraError = errorText
+	if errorText == "摄像头已关闭" {
+		a.cameraAvailable = false
+		a.facePresent = false
+		a.noFaceSince = time.Time{}
+		a.cameraError = ""
+		return
+	}
 	if errorText != "" {
 		a.cameraAvailable = false
 		a.facePresent = false
